@@ -23,7 +23,6 @@ This implementation uses **soft parameter sharing** with:
 
 ## 📁 Folder Structure
 
-```
 
 Multitask-IDRiD/
 ├── data/
@@ -43,7 +42,7 @@ Multitask-IDRiD/
 ├── requirements.txt
 └── README.md
 
-````
+
 
 ---
 
