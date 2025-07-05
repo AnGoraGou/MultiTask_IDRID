@@ -1,490 +1,349 @@
-#baseline_inference.py: Inference for classification and segmentation baselines
-import os
-import glob
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
-from tqdm import tqdm
-import pandas as pd
-from sklearn.metrics import accuracy_score, classification_report
+#!/usr/bin/env python
+# ------------------------------------------------------------
+#  baseline_inference_clean.py
+#  • Patch-wise batched segmentation & classification
+#  • GPU-friendly
+#  • Robust CSV / path handling
+#  • Summary metrics + per-image logs
+# ------------------------------------------------------------
+from __future__ import annotations
 
+import json, warnings, glob
+from pathlib import Path
+from typing import List, Tuple, Dict
+
+import numpy as np
+import pandas as pd
 import torch
-import torch.nn.functional as F
+from torch import nn
 from torchvision import transforms, models
 import segmentation_models_pytorch as smp
+from sklearn.metrics import accuracy_score, classification_report
+from PIL import Image
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from torchvision.models import resnet18, ResNet18_Weights
 
-#from utils.metrics import dice_score
-
-def dice_score(preds, targets, eps=1e-7):
-    # Assumes preds and targets are binary tensors of same shape
-    preds = preds.astype(float)
-    targets = targets.astype(float)
-    #print(f'Max: {preds.max()} || {targets.max()}')
-
-    intersection = (preds * targets).sum()
-    union = preds.sum() + targets.sum()
-    dice = (2. * intersection + eps) / (union + eps)
-    #print(f'Dice: {dice:.4f}')
-    return dice
-
-
-
-
-# --- Configuration ---
+# ------------------------------------------------------------------
+# 1. CONFIG  – all hard-coded paths live here, rooted in the script dir
+# ------------------------------------------------------------------
 class Config:
-    RUN_SEGMENTATION = True
+    # toggles
+    RUN_SEGMENTATION   = False
     RUN_CLASSIFICATION = True
 
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Paths for Segmentation Task
-    SEG_IMG_DIR = '/home/nilgiri/Downloads/archive/A20Segmentation/Segmentation/OriginalImages/TestingSet'
-    SEG_MASK_DIR = '/home/nilgiri/Downloads/archive/A20Segmentation/Segmentation/AllSegmentationGroundtruths/TestingSet/OpticDisc'
-    SEG_MODEL_DIR = '/home/nilgiri/Downloads/archive/idrid_project/outputs/models' #'outputs/seg_baseline_models'
+    # project root (folder that holds this file)
+    ROOT = Path(__file__).resolve().parent
 
-    # Paths for Classification Task
-    CLASSIF_IMG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'B20Disease20Grading', 'DiseaseGrading', 'OriginalImages', 'TestingSet'))
-    CLASSIF_GT_LABELS_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'B20Disease20Grading', 'DiseaseGrading', 'Groundtruths', 'IDRiD_Disease_Grading_Testing_Labels.csv'))
-    CLS_MODEL_DIR = '/home/nilgiri/Downloads/archive/idrid_project/outputs/models' #'outputs/baseline_models'
+    # ------------- segmentation -------------
+    SEG_IMG_DIR   = ROOT.parent / 'A20Segmentation' / 'Segmentation' / 'OriginalImages' / 'TestingSet'
+    SEG_MASK_DIR  = ROOT.parent / 'A20Segmentation' / 'Segmentation' / 'AllSegmentationGroundtruths' / 'TestingSet' / 'OpticDisc'
+    SEG_MODEL_DIR = ROOT / 'outputs' / 'seg_baseline_models'
 
-    OUTPUT_BASE_DIR = 'test_results'
-    OUTPUT_SUBDIR = 'baseline_separate_models'
-    OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, OUTPUT_SUBDIR)
+    # ------------- classification -----------
+    CLS_IMG_DIR   = ROOT.parent / 'B20Disease20Grading' / 'DiseaseGrading' / 'OriginalImages' / 'TestingSet'
+    CLS_GT_CSV    = ROOT.parent / 'B20Disease20Grading' / 'DiseaseGrading' / 'Groundtruths' / 'IDRiD_Disease_Grading_Testing_Labels.csv'
+    CLS_MODEL_DIR = ROOT / 'outputs' / 'baseline_models'
 
-    # Image processing dimensions
+    # ------------- outputs ------------------
+    OUTPUT_DIR    = ROOT / 'outputs' / 'test_results_refactored'
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # image sizes
     ORIGINAL_CROP_SIZE = 2048
-    MODEL_INPUT_SIZE = 512
+    MODEL_INPUT_SIZE   = 512
 
-    # Model parameters
-    SEG_ENCODER_NAME = "resnet18"
-    SEG_ENCODER_WEIGHTS = "imagenet"
-    SEG_OUT_CHANNELS = 1
+    # model hyper-params
+    SEG_ENCODER_NAME    = 'resnet18'
+    SEG_ENCODER_WEIGHTS = 'imagenet'
+    SEG_OUT_CHANNELS    = 1
+    CLS_NUM_CLASSES     = 5
 
-    CLS_NUM_CLASSES = 5
-
-
-# ============ CONFIG ============
-RUN_SEGMENTATION = True
-RUN_CLASSIFICATION = False
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IMG_DIR = '/home/nilgiri/Downloads/archive/A20Segmentation/Segmentation/OriginalImages/TestingSet'
-MASK_DIR = '/home/nilgiri/Downloads/archive/A20Segmentation/Segmentation/AllSegmentationGroundtruths/TestingSet/OpticDisc'
-OUTPUT_DIR = 'test_results/baseline'
-CLS_BASELINE_DIR = 'outputs/baseline_models'
-SEG_BASELINE_DIR = 'outputs/seg_baseline_models'
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # classification aggregation: 'vote' or 'softmax'
+    AGGREGATE = 'vote'
 
 
-# Create output directory
-os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
-
-# --- Model Loading ---
-seg_model = None
-cls_model = None
-
-if Config.RUN_SEGMENTATION:
-    try:
-        seg_model_path = sorted(glob.glob(os.path.join(Config.SEG_MODEL_DIR, 'seg_best_model_*.pth')))[-1]
-        print(f"Loading segmentation model from {seg_model_path}")
-        seg_model = smp.Unet(
-            encoder_name=Config.SEG_ENCODER_NAME,
-            encoder_weights=Config.SEG_ENCODER_WEIGHTS,
-            in_channels=3,
-            classes=Config.SEG_OUT_CHANNELS
-        ).to(Config.DEVICE)
-        seg_model.load_state_dict(torch.load(seg_model_path, map_location=Config.DEVICE))
-        seg_model.eval()
-    except IndexError:
-        print(f"Error: No segmentation models found in {Config.SEG_MODEL_DIR}. Set RUN_SEGMENTATION = False or check path.")
-        Config.RUN_SEGMENTATION = False
-    except Exception as e:
-        print(f"Error loading segmentation model: {e}")
-        Config.RUN_SEGMENTATION = False
-
-if Config.RUN_CLASSIFICATION:
-    try:
-        cls_model_path = sorted(glob.glob(os.path.join(Config.CLS_MODEL_DIR, 'cls_best_model_*.pth')))[-1]
-        print(f"Loading classification model from {cls_model_path}")
-        cls_model = models.resnet18(pretrained=False)
-        cls_model.fc = torch.nn.Linear(cls_model.fc.in_features, Config.CLS_NUM_CLASSES)
-        cls_model = cls_model.to(Config.DEVICE)
-        cls_model.load_state_dict(torch.load(cls_model_path, map_location=Config.DEVICE))
-        cls_model.eval()
-    except IndexError:
-        print(f"Error: No classification models found in {Config.CLS_MODEL_DIR}. Set RUN_CLASSIFICATION = False or check path.")
-        Config.RUN_CLASSIFICATION = False
-    except Exception as e:
-        print(f"Error loading classification model: {e}")
-        Config.RUN_CLASSIFICATION = False
-
-
-# --- Image Transformations ---
-preprocess_transform = transforms.Compose([
+# ------------------------------------------------------------------
+# 2. SIMPLE UTILS
+# ------------------------------------------------------------------
+to_model_tensor = transforms.Compose([
     transforms.Resize((Config.MODEL_INPUT_SIZE, Config.MODEL_INPUT_SIZE)),
     transforms.ToTensor()
 ])
 
-# ============ REVISED FUNCTIONS FOR GRID PATCHING ============
+def dice_score(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-7) -> float:
+    """Binary Dice."""
+    pred, gt = pred.astype(float), gt.astype(float)
+    inter = (pred * gt).sum()
+    union = pred.sum() + gt.sum()
+    return (2 * inter + eps) / (union + eps)
 
-def get_patches_and_coords(img_np: np.ndarray, patch_size: int = Config.ORIGINAL_CROP_SIZE) -> list:
-    """
-    Extracts non-overlapping patches from an image, including handling edges.
-    Pads the image if necessary to ensure all patches are of patch_size.
+# ---------- patch helpers ----------
+def extract_patches(im: np.ndarray,
+                    patch: int = Config.ORIGINAL_CROP_SIZE
+                   ) -> Tuple[List[np.ndarray], List[Tuple[int,int]], int, int]:
+    """Return non-overlapping patches, their coords, and padded sizes."""
+    h, w = im.shape[:2]
+    pad_h = (patch - h % patch) % patch
+    pad_w = (patch - w % patch) % patch
+    padded = np.pad(im, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
+    ph, pw = padded.shape[:2]
 
-    Args:
-        img_np: The input image as a NumPy array (H, W, C).
-        patch_size: The desired size of each square patch.
+    patches, coords = [], []
+    for y in range(0, ph, patch):
+        for x in range(0, pw, patch):
+            patches.append(padded[y:y+patch, x:x+patch])
+            coords.append((y, x))
+    return patches, coords, ph, pw
 
-    Returns:
-        A list of tuples: (patch_np, (y_start, x_start, y_end, x_end_original), (y_padding, x_padding)).
-        y_end, x_end_original are coords in the *original* image.
-        y_padding, x_padding are the amounts of padding applied to *this specific patch*.
-    """
-    h, w = img_np.shape[:2]
-    patches = []
-    
-    # Pad the image to ensure dimensions are multiples of patch_size
-    pad_h = (patch_size - (h % patch_size)) % patch_size
-    pad_w = (patch_size - (w % patch_size)) % patch_size
-    
-    # You might want to pad with zeros or reflections depending on your training
-    # For now, zero padding is simple. Pad symmetrically if possible.
-    padded_img_np = np.pad(img_np, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant', constant_values=0)
-    
-    # Get new dimensions
-    padded_h, padded_w = padded_img_np.shape[:2]
+def stitch_patches(pred_patches: List[np.ndarray], coords: List[Tuple[int,int]],
+                   out_h: int, out_w: int, padded_h: int, padded_w: int,
+                   patch: int = Config.ORIGINAL_CROP_SIZE) -> np.ndarray:
+    """Stitch 512-sized predicted patches (uint8) back to original canvas."""
+    canvas = np.zeros((padded_h, padded_w), dtype=np.uint8)
+    for p, (y, x) in zip(pred_patches, coords):
+        big = np.array(Image.fromarray(p).resize((patch, patch), Image.NEAREST))
+        canvas[y:y+patch, x:x+patch] = big
+    return canvas[:out_h, :out_w]
 
-    for y in range(0, padded_h, patch_size):
-        for x in range(0, padded_w, patch_size):
-            patch = padded_img_np[y : y + patch_size, x : x + patch_size]
-            
-            # Calculate original coordinates for stitching
-            original_y_end = min(y + patch_size, h)
-            original_x_end = min(x + patch_size, w)
-            
-            # Calculate padding for this specific patch
-            # This is tricky because the patch itself isn't padded, the whole image is.
-            # We need to know how much of *this patch* corresponds to the original image.
-            # Simplest approach: stitch into a padded canvas, then crop final result.
-            
-            patches.append((patch, (y, x))) # Store patch and its top-left coordinate in the padded image
-
-    return patches, padded_h, padded_w
-
-
-def stitch_all_patches_back(predicted_patches: list, original_h: int, original_w: int, 
-                             padded_h: int, padded_w: int,
-                             model_output_size: int = Config.MODEL_INPUT_SIZE,
-                             patch_size_original: int = Config.ORIGINAL_CROP_SIZE) -> np.ndarray:
-    """
-    Stitches predicted patches back into an image of original dimensions.
-    Assumes predicted_patches are already resized from model_output_size to patch_size_original.
-
-    Args:
-        predicted_patches: A list of tuples (resized_patch_np, (y_start, x_start))
-                         where y_start, x_start are coordinates in the *padded* image.
-        original_h: Original height of the image (before padding).
-        original_w: Original width of the image (before padding).
-        padded_h: Height of the image after padding.
-        padded_w: Width of the image after padding.
-        model_output_size: Size of the model's direct output (e.g., 512x512).
-        patch_size_original: The size of the original patch (e.g., 2048x2048) before resizing for model input.
-
-    Returns:
-        The stitched image as a NumPy array, cropped to original_h, original_w.
-    """
-    # Create a canvas of the padded size
-    stitched_padded = np.zeros((padded_h, padded_w), dtype=np.uint8)
-
-    for pred_patch_512, (y_start, x_start) in predicted_patches:
-        # Resize the 512x512 prediction back to 2048x2048 for stitching
-        resized_pred_patch = np.array(Image.fromarray(pred_patch_512).resize((patch_size_original, patch_size_original), Image.NEAREST))
-        
-        stitched_padded[y_start : y_start + patch_size_original, x_start : x_start + patch_size_original] = resized_pred_patch
-
-    # Crop the stitched result back to the original image dimensions
-    final_stitched = stitched_padded[0:original_h, 0:original_w]
-    return final_stitched
-
-
-# ============ INFERENCE ============
-def run_inference():
-    # --- Load Classification Ground Truths ---
-    classification_ground_truths = {}
-    if Config.RUN_CLASSIFICATION:
-        try:
-            df_labels = pd.read_csv(Config.CLASSIF_GT_LABELS_PATH)
-            if 'Image Name' in df_labels.columns and 'Retinopathy grade' in df_labels.columns:
-                for index, row in df_labels.iterrows():
-                    image_base_name = os.path.splitext(row['Image Name'])[0]
-                    classification_ground_truths[image_base_name] = int(row['Retinopathy grade'])
-                print(f"Loaded {len(classification_ground_truths)} classification ground truth labels.")
-            else:
-                print(f"Error: CSV file '{Config.CLASSIF_GT_LABELS_PATH}' must contain 'Image Name' and 'Retinopathy grade' columns.")
-                Config.RUN_CLASSIFICATION = False
-        except FileNotFoundError:
-            print(f"Error: Classification ground truth file not found at {Config.CLASSIF_GT_LABELS_PATH}")
-            Config.RUN_CLASSIFICATION = False
-        except Exception as e:
-            print(f"Error loading classification ground truth CSV: {e}")
-            Config.RUN_CLASSIFICATION = False
-
-    image_paths_for_processing = sorted(glob.glob(os.path.join(Config.SEG_IMG_DIR, '*.jpg')))
-    mask_paths_for_processing = sorted(glob.glob(os.path.join(Config.SEG_MASK_DIR, '*.png')))
-    print(f'Length mask : {mask_paths_for_processing}')
-    
-
-    if not image_paths_for_processing:
-        print("Error: No images found in the segmentation image directory. Exiting.")
-        return
-    if Config.RUN_SEGMENTATION and not mask_paths_for_processing:
-        print("Warning: Segmentation is enabled but no masks found. Segmentation metrics will not be calculated.")
-    
-    all_dice_scores = []
-    all_true_classes = []
-    all_predicted_classes = []
-
-    print(f"Total images to process: {len(image_paths_for_processing)}")
-
-    for img_path in tqdm(image_paths_for_processing, desc="Processing images"):
-        base_name = os.path.splitext(os.path.basename(img_path))[0]
-        img = Image.open(img_path).convert("RGB")
-        img_np = np.array(img)
-        original_h, original_w = img_np.shape[:2]
-
-        # --- Segmentation Inference ---
-        if Config.RUN_SEGMENTATION and seg_model is not None:
-            mask_path = os.path.join(Config.SEG_MASK_DIR, base_name + '_OD.tif')
-            #print(f'Processing: {mask_path}')
-            if os.path.exists(mask_path):
-                # Get all patches for segmentation
-                patches_with_coords, padded_h, padded_w = get_patches_and_coords(img_np, Config.ORIGINAL_CROP_SIZE)
-                
-                predicted_patches_for_stitching = []
-                for patch_np, (y_start, x_start) in patches_with_coords:
-                    patch_tensor = preprocess_transform(Image.fromarray(patch_np)).unsqueeze(0).to(Config.DEVICE)
-                    with torch.no_grad():
-                        output_binary_512 = (torch.sigmoid(seg_model(patch_tensor)).squeeze().cpu().numpy() > 0.5)
-                        predicted_patches_for_stitching.append(((output_binary_512 * 255).astype(np.uint8), (y_start, x_start)))
-
-                # Stitch all patches back
-                stitched_pred = stitch_all_patches_back(
-                    predicted_patches_for_stitching,
-                    original_h, original_w,
-                    padded_h, padded_w
-                )
-                
-                gt_mask = (np.array(Image.open(mask_path).convert("L")) > 10).astype(np.uint8)
-                #print(f'gt_mask: {gt_mask.shape} & {np.unique(gt_mask)} || stitched_pred: {stitched_pred.shape} & {np.unique(stitched_pred)}')
-                dice = dice_score(stitched_pred > 127, gt_mask)
-                all_dice_scores.append(dice)
-
-                # Save visualization
-                fig, axs = plt.subplots(1, 3, figsize=(18, 6))
-                axs[0].imshow(img_np)
-                axs[0].set_title("Original Image")
-                axs[1].imshow(gt_mask, cmap='gray')
-                axs[1].set_title("Ground Truth Mask")
-                axs[2].imshow(stitched_pred, cmap='gray')
-                axs[2].set_title(f"Prediction - Dice: {dice:.3f}")
-                for ax in axs:
-                    ax.axis('off')
-                plt.tight_layout()
-                plt.savefig(os.path.join(Config.OUTPUT_DIR, f"{base_name}_seg.png"))
-                plt.close()
-            else:
-                print(f"Warning: Segmentation mask not found for {base_name}. Skipping segmentation for this image.")
-
-
-        # --- Classification Inference ---
-        if Config.RUN_CLASSIFICATION and cls_model is not None:
-            img_path_classif = os.path.join(Config.CLASSIF_IMG_DIR, os.path.basename(img_path))
-            if os.path.exists(img_path_classif):
-                cls_img = Image.open(img_path_classif).convert("RGB")
-                
-                # Apply transformations (entire image, not patched, as per your original classification logic)
-                input_tensor_cls = preprocess_transform(cls_img).unsqueeze(0).to(Config.DEVICE)
-
-                with torch.no_grad():
-                    logits = cls_model(input_tensor_cls)
-                    predicted_class = torch.argmax(logits, dim=1).item()
-                
-                ground_truth_class = classification_ground_truths.get(base_name, None)
-
-                if ground_truth_class is not None:
-                    all_true_classes.append(ground_truth_class)
-                    all_predicted_classes.append(predicted_class)
-                    
-                    with open(os.path.join(Config.OUTPUT_DIR, f"{base_name}_class.txt"), 'w') as f:
-                        f.write(f"Predicted Class: {predicted_class}\n")
-                        f.write(f"Ground Truth Class: {ground_truth_class}\n")
-                        f.write(f"Correct Classification: {predicted_class == ground_truth_class}\n")
-                    
-                    print(f"\n--- Classification Results for {base_name} ---")
-                    print(f"Predicted Class: {predicted_class}")
-                    print(f"Ground Truth Class: {ground_truth_class}")
-                    print(f"Correct: {predicted_class == ground_truth_class}")
-                    print("-" * 40)
-                else:
-                    with open(os.path.join(Config.OUTPUT_DIR, f"{base_name}_class.txt"), 'w') as f:
-                        f.write(f"Predicted Class: {predicted_class}\n")
-                        f.write("Ground Truth Class: Not Found\n")
-                    print(f"\n--- Classification Results for {base_name} (Ground Truth Not Found) ---")
-                    print(f"Predicted Class: {predicted_class}")
-                    print("-" * 40)
-            else:
-                print(f"Warning: Classification image not found for {base_name} in {Config.CLASSIF_IMG_DIR}. Skipping classification for this image.")
-
-
-# ============ FINAL REPORT ============
-    if Config.RUN_SEGMENTATION:
-        if all_dice_scores:
-            avg_dice = np.mean(all_dice_scores)
-            print(f"\n__ Average Dice over Test Set (Segmentation): {avg_dice:.4f}")
-        else:
-            print("\nNo Dice scores calculated (no segmentation images processed or masks found).")
-
-    if Config.RUN_CLASSIFICATION:
-        if all_true_classes and all_predicted_classes:
-            if len(all_true_classes) == len(all_predicted_classes):
-                accuracy = accuracy_score(all_true_classes, all_predicted_classes)
-                print(f"\n__ Classification Accuracy: {accuracy:.4f}")
-                print("\n__ Classification Report:")
-                target_names = [f'Grade {i}' for i in range(Config.CLS_NUM_CLASSES)]
-                print(classification_report(all_true_classes, all_predicted_classes, target_names=target_names, zero_division='warn'))
-            else:
-                print("\nWarning: Mismatch in length of true and predicted class lists. Cannot calculate full classification metrics.")
-        else:
-            print("\nNo classification results to report (missing ground truth or predictions).")
-
-if __name__ == "__main__":
-    run_inference()
-
-'''
-import os
-import glob
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
-from tqdm import tqdm
-
-import torch
-import torch.nn.functional as F
-from torchvision import transforms, models
-import segmentation_models_pytorch as smp
-
-from utils.metrics import dice_score
-
-# ============ CONFIG ============
-RUN_SEGMENTATION = True
-RUN_CLASSIFICATION = True
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IMG_DIR = '/home/nilgiri/Downloads/archive/A20Segmentation/Segmentation/OriginalImages/TestingSet'
-MASK_DIR = '/home/nilgiri/Downloads/archive/A20Segmentation/Segmentation/AllSegmentationGroundtruths/TestingSet/OpticDisc'
-OUTPUT_DIR = 'test_results/baseline'
-CLS_BASELINE_DIR = 'outputs/baseline_models'
-SEG_BASELINE_DIR = 'outputs/seg_baseline_models'
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# ============ MODELS ============
-if RUN_SEGMENTATION:
-    seg_model_path = sorted(glob.glob(os.path.join(SEG_BASELINE_DIR, 'seg_best_model_*.pth')))[-1]
-    seg_model = smp.Unet(
-        encoder_name="resnet18",
-        encoder_weights="imagenet",
+# ------------------------------------------------------------------
+# 3. MODEL LOADING
+# ------------------------------------------------------------------
+def load_segmentation_model() -> nn.Module | None:
+    if not Config.SEG_MODEL_DIR.exists():
+        warnings.warn('[SEG] model dir not found'); return None
+    ckpts = sorted(Config.SEG_MODEL_DIR.glob('seg_best_model_*.pth'))
+    if not ckpts:
+        warnings.warn('[SEG] no checkpoint'); return None
+    ckpt = ckpts[-1]
+    model = smp.Unet(
+        encoder_name=Config.SEG_ENCODER_NAME,
+        encoder_weights=Config.SEG_ENCODER_WEIGHTS,
         in_channels=3,
-        classes=1
-    ).to(DEVICE)
-    seg_model.load_state_dict(torch.load(seg_model_path, map_location=DEVICE))
-    seg_model.eval()
-    print(f"Loaded segmentation model from {seg_model_path}")
+        classes=Config.SEG_OUT_CHANNELS
+    ).to(Config.DEVICE)
+    model.load_state_dict(torch.load(ckpt, map_location=Config.DEVICE))
+    model.eval()
+    print(f'[SEG] loaded {ckpt.name}')
+    return model
 
-if RUN_CLASSIFICATION:
-    cls_model_path = sorted(glob.glob(os.path.join(CLS_BASELINE_DIR, 'cls_best_model_*.pth')))[-1]
-    cls_model = models.resnet18(pretrained=False)
-    cls_model.fc = torch.nn.Linear(cls_model.fc.in_features, 5)
-    cls_model = cls_model.to(DEVICE)
-    cls_model.load_state_dict(torch.load(cls_model_path, map_location=DEVICE))
-    cls_model.eval()
-    print(f"Loaded classification model from {cls_model_path}")
+def load_classification_model() -> nn.Module | None:
+    if not Config.CLS_MODEL_DIR.exists():
+        warnings.warn('[CLS] model dir not found'); return None
+    ckpts = sorted(Config.CLS_MODEL_DIR.glob('cls_best_model_*.pth'))
+    if not ckpts:
+        warnings.warn('[CLS] no checkpoint'); return None
+    ckpt = ckpts[-1]
+    #model = models.resnet18(pretrained=False)
+    weights = ResNet18_Weights.IMAGENET1K_V1  # or None
+    model = models.resnet18(weights=weights)
+    model.fc = nn.Linear(model.fc.in_features, Config.CLS_NUM_CLASSES)
+    model.to(Config.DEVICE)
+    model.load_state_dict(torch.load(ckpt, map_location=Config.DEVICE))
+    model.eval()
+    print(f'[CLS] loaded {ckpt.name}')
+    return model
 
-# ============ TRANSFORMS ============
-resize = transforms.Resize((512, 512))
-to_tensor = transforms.ToTensor()
+# ------------------------------------------------------------------
+# 4. GROUND-TRUTH CSV
+# ------------------------------------------------------------------
+def load_ground_truths() -> Dict[str, int]:
+    #print(Config.CLS_GT_CSV)
+    try:
+        df = pd.read_csv(Config.CLS_GT_CSV)
+    except FileNotFoundError:
+        warnings.warn('[CLS] ground-truth CSV not found; disabling classification')
+        Config.RUN_CLASSIFICATION = False
+        return {}
+    need = {'Image name', 'Retinopathy grade'}
+    if not need.issubset(df.columns):
+        raise ValueError(f'CSV missing cols: {need - set(df.columns)}')
+    gt = {row['Image name'].split('.')[0]: int(row['Retinopathy grade'])
+          for _, row in df.iterrows()}
+    print(f'[CLS] loaded {len(gt)} GT labels')
+    return gt
 
-# ============ FUNCTIONS ============
-def get_four_corners(img_np, crop_size=2048):
-    h, w = img_np.shape[:2]
-    crops = [
-        img_np[0:crop_size, 0:crop_size],
-        img_np[0:crop_size, w - crop_size:w],
-        img_np[h - crop_size:h, 0:crop_size],
-        img_np[h - crop_size:h, w - crop_size:w]
-    ]
-    return crops
+# ------------------------------------------------------------------
+# 5. INFERENCE ROUTINES
+# ------------------------------------------------------------------
+def infer_segmentation(model: nn.Module,
+                       img_np: np.ndarray,
+                       base: str) -> float | None:
+    """Return Dice score (or None)."""
+    if model is None: return None
+    patches, coords, ph, pw = extract_patches(img_np)
+    batch = torch.stack([to_model_tensor(Image.fromarray(p)) for p in patches]
+                       ).to(Config.DEVICE)
+    with torch.no_grad():
+        preds = (torch.sigmoid(model(batch)) > 0.5).float()
+    pred_bytes = [(pred.squeeze() * 255).byte().cpu().numpy() for pred in preds]
+    stitched = stitch_patches(pred_bytes, coords,
+                              *img_np.shape[:2], ph, pw)
 
-def stitch_back(crops, h, w, crop_size=2048):
-    stitched = np.zeros((h, w), dtype=np.uint8)
-    stitched[0:crop_size, 0:crop_size] = crops[0]
-    stitched[0:crop_size, w - crop_size:w] = crops[1]
-    stitched[h - crop_size:h, 0:crop_size] = crops[2]
-    stitched[h - crop_size:h, w - crop_size:w] = crops[3]
-    return stitched
+    mask_path = Config.SEG_MASK_DIR / f'{base}_OD.tif'
+    #print(mask_path)
+    #exit()
+    if not mask_path.exists():
+        warnings.warn(f'[SEG] no GT mask for {base}')
+        return None
+    gt = (np.array(Image.open(mask_path).convert('L')) > 10).astype(np.uint8)
+    dsc = dice_score(stitched > 127, gt)
 
-# ============ INFERENCE ============
-image_paths = sorted(glob.glob(os.path.join(IMG_DIR, '*.jpg')))
-mask_paths = sorted(glob.glob(os.path.join(MASK_DIR, '*.tif')))
-dice_scores = []
+    # quick visual
+    fig, ax = plt.subplots(1, 3, figsize=(14, 4.5))
+    ax[0].imshow(img_np); ax[0].set_title('Image')
+    ax[1].imshow(gt, cmap='gray'); ax[1].set_title('GT')
+    ax[2].imshow(stitched, cmap='gray'); ax[2].set_title(f'Pred (Dice={dsc:.3f})')
+    for a in ax: a.axis('off')
+    plt.tight_layout()
+    plt.savefig(Config.OUTPUT_DIR / f'{base}_seg.png')
+    plt.close()
+    return dsc
 
-for img_path, mask_path in tqdm(zip(image_paths, mask_paths), total=len(image_paths)):
-    base_name = os.path.splitext(os.path.basename(img_path))[0]
-    img = Image.open(img_path).convert("RGB")
-    img_np = np.array(img)
-    h, w = img_np.shape[:2]
+def aggregate_patch_predictions(logits: torch.Tensor) -> int:
+    if Config.AGGREGATE == 'softmax':
+        probs = torch.softmax(logits, 1).mean(0)
+        return int(probs.argmax().item())
+    # vote
+    labels = torch.argmax(logits, 1).cpu().numpy()
+    return int(np.bincount(labels).argmax())
 
-    # --- Segmentation ---
-    if RUN_SEGMENTATION:
-        pred_crops = []
-        gt_mask = np.array(Image.open(mask_path).convert("L")) > 127
+def infer_classification(model: nn.Module,
+                         img_np: np.ndarray,
+                         base: str,
+                         gt_map: Dict[str, int],
+                         true_cls: List[int],
+                         pred_cls: List[int]):
+    if model is None: return
+    patches, _, _, _ = extract_patches(img_np)
+    if not patches:
+        warnings.warn(f'[CLS] no patches for {base}'); return
+    batch = torch.stack([to_model_tensor(Image.fromarray(p)) for p in patches]
+                       ).to(Config.DEVICE)
+    with torch.no_grad():
+        logits = model(batch)
+    pred = aggregate_patch_predictions(logits)
 
-        for crop_np in get_four_corners(img_np):
-            crop_tensor = to_tensor(resize(Image.fromarray(crop_np))).unsqueeze(0).to(DEVICE)
-            with torch.no_grad():
-                output = torch.sigmoid(seg_model(crop_tensor)).squeeze().cpu().numpy() > 0.5
-                pred_crops.append((output * 255).astype(np.uint8))
+    gt = gt_map.get(base)
+    # write log
+    (Config.OUTPUT_DIR / f'{base}_class.txt').write_text(
+        json.dumps({'pred': pred, 'gt': gt}, indent=2)
+    )
+    if gt is not None:
+        true_cls.append(gt)
+        pred_cls.append(pred)
 
-        stitched_pred = stitch_back(pred_crops, h, w)
-        dice = dice_score(stitched_pred > 127, gt_mask)
-        dice_scores.append(dice)
+# ------------------------------------------------------------------
+# 6. MAIN
+# ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 6. MAIN – separate loops for SEG and CLS
+# ------------------------------------------------------------------
 
-        # Save visualization
-        fig, axs = plt.subplots(1, 3, figsize=(18, 6))
-        axs[0].imshow(img_np)
-        axs[0].set_title("Original Image")
-        axs[1].imshow(gt_mask, cmap='gray')
-        axs[1].set_title("Ground Truth")
-        axs[2].imshow(stitched_pred, cmap='gray')
-        axs[2].set_title(f"Prediction - Dice: {dice:.3f}")
-        for ax in axs:
-            ax.axis('off')
-        plt.tight_layout()
-        plt.savefig(os.path.join(OUTPUT_DIR, f"{base_name}_seg.png"))
-        plt.close()
+def main():
+    seg_model = load_segmentation_model() if Config.RUN_SEGMENTATION   else None
+    cls_model = load_classification_model() if Config.RUN_CLASSIFICATION else None
+    gt_map    = load_ground_truths()        if Config.RUN_CLASSIFICATION else {}
 
-    # --- Classification ---
-    if RUN_CLASSIFICATION:
-        resized = resize(Image.fromarray(img_np))
-        tensor = to_tensor(resized).unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            logits = cls_model(tensor)
-            pred_class = torch.argmax(logits, dim=1).item()
-        with open(os.path.join(OUTPUT_DIR, f"{base_name}_class.txt"), 'w') as f:
-            f.write(f"Predicted Class: {pred_class}\n")
+    # ---------- 6-A  Segmentation loop ----------
+    dice_scores = []
+    if seg_model:
+        seg_imgs = sorted(Config.SEG_IMG_DIR.glob('*.jpg'))
+        if not seg_imgs:
+            print('[SEG] No test images found.')
+        for p in tqdm(seg_imgs, desc='Segmentation'):
+            base = p.stem          # keep the .lower() because masks use same base
+            try:
+                img_np = np.array(Image.open(p).convert('RGB'))
+            except Exception as e:
+                warnings.warn(f'[SEG] Cannot read {p.name}: {e}')
+                continue
+            d = infer_segmentation(seg_model, img_np, base)
+            if d is not None:
+                dice_scores.append(d)
 
-# ============ FINAL REPORT ============
-if RUN_SEGMENTATION:
-    avg_dice = np.mean(dice_scores)
-    print(f"\n__ Average Dice over Test Set: {avg_dice:.4f}")
+    # ---------- 6-B  Classification loop ----------
+    true_cls, pred_cls = [], []
+    if cls_model:
+        cls_imgs = sorted(Config.CLS_IMG_DIR.glob('*.jpg'))
+        if not cls_imgs:
+            print('[CLS] No test images found.')
+        for p in tqdm(cls_imgs, desc='Classification'):
+            base = p.stem                  # NOTE: *no* .lower() – the CSV keys keep case
+            try:
+                img_np = np.array(Image.open(p).convert('RGB'))
+            except Exception as e:
+                warnings.warn(f'[CLS] Cannot read {p.name}: {e}')
+                continue
+            infer_classification(cls_model, img_np, base, gt_map,
+                                 true_cls, pred_cls)
+
+    # ---------- 6-C  Summary ----------
+    if dice_scores:
+        print(f'\n[SEG] Mean Dice: {np.mean(dice_scores):.4f}'
+              f' on {len(dice_scores)} images')
+
+    if true_cls:
+        acc = accuracy_score(true_cls, pred_cls)
+        print(f'\n[CLS] Accuracy : {acc:.4f}')
+        print(classification_report(
+            true_cls, pred_cls,
+            target_names=[f'Grade {i}' for i in range(Config.CLS_NUM_CLASSES)],
+            zero_division='warn'
+        ))
+    elif cls_model:
+        print('\n[CLS] No test images had ground-truth labels ⇒ metrics skipped.')
+
+
 '''
+def main():
+    #print(Config.SEG_IMG_DIR)
+    
+    seg_model = load_segmentation_model() if Config.RUN_SEGMENTATION else None
+    cls_model = load_classification_model() if Config.RUN_CLASSIFICATION else None
+    gt_map    = load_ground_truths()        if Config.RUN_CLASSIFICATION else {}
+
+    img_paths = sorted(Config.SEG_IMG_DIR.glob('*.jpg'))
+    if not img_paths:
+        print('[MAIN] no test images found – nothing to do'); return
+
+    dice_scores, true_cls, pred_cls = [], [], []
+    for p in tqdm(img_paths, desc='Images'):
+        base = p.stem
+        try:
+            img_np = np.array(Image.open(p).convert('RGB'))
+        except Exception as e:
+            warnings.warn(f'Cannot read {p.name}: {e}')
+            continue
+
+        # segmentation
+        if seg_model:
+            d = infer_segmentation(seg_model, img_np, base)
+            if d is not None: dice_scores.append(d)
+
+        # classification
+        if cls_model:
+            infer_classification(cls_model, img_np, base,
+                                 gt_map, true_cls, pred_cls)
+
+    # ---------- summary ----------
+    if dice_scores:
+        print(f'\n[SEG] Mean Dice  : {np.mean(dice_scores):.4f} '
+              f'on {len(dice_scores)} images')
+
+    if true_cls:
+        acc = accuracy_score(true_cls, pred_cls)
+        print(f'\n[CLS] Accuracy   : {acc:.4f}')
+        print(classification_report(
+            true_cls, pred_cls,
+            target_names=[f'Grade {i}' for i in range(Config.CLS_NUM_CLASSES)],
+            zero_division='warn'
+        ))
+    elif cls_model:
+        print('\n[CLS] No images had ground-truth labels → metrics skipped.')
+'''
+if __name__ == '__main__':
+    main()
